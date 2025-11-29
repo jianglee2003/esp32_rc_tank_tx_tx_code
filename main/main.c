@@ -23,21 +23,21 @@
 // Program mode
 #define TX_MODE                     1
 #define RX_MODE                     0
-#define PROGRAM_MODE                TX_MODE
+#define PROGRAM_MODE                RX_MODE
 
 // Macro for LEDC PWM.
 #define LEDC_TIMER                  LEDC_TIMER_0
 #define LEDC_MODE                   LEDC_LOW_SPEED_MODE
 
-#define MOTOR_A_FORWARD_CHANNEL     LEDC_CHANNEL_0
-#define MOTOR_A_BACKWARD_CHANNEL    LEDC_CHANNEL_1
-#define MOTOR_B_FORWARD_CHANNEL     LEDC_CHANNEL_2
-#define MOTOR_B_BACKWARD_CHANNEL    LEDC_CHANNEL_3
+#define MOTOR_L_FORWARD_CHANNEL     LEDC_CHANNEL_1
+#define MOTOR_L_BACKWARD_CHANNEL    LEDC_CHANNEL_2
+#define MOTOR_R_FORWARD_CHANNEL     LEDC_CHANNEL_3
+#define MOTOR_R_BACKWARD_CHANNEL    LEDC_CHANNEL_4
 
-#define MOTOR_A_FORWARD_PIN         GPIO_NUM_13
-#define MOTOR_A_BACKWARD_PIN        GPIO_NUM_12
-#define MOTOR_B_FORWARD_PIN         GPIO_NUM_14
-#define MOTOR_B_BACKWARD_PIN        GPIO_NUM_27
+#define MOTOR_L_FORWARD_PIN         GPIO_NUM_13
+#define MOTOR_L_BACKWARD_PIN        GPIO_NUM_12
+#define MOTOR_R_FORWARD_PIN         GPIO_NUM_14
+#define MOTOR_R_BACKWARD_PIN        GPIO_NUM_27
 
 #define LEDC_DUTY_RESOLUTION        LEDC_TIMER_10_BIT // Set duty resolution to 10 bits
 #define LEDC_FREQUENCY              (38000) // Frequency in Hertz. Set frequency at 38 kHz
@@ -47,7 +47,7 @@
  * - Due to high input voltage for the motor (5S - 18,5V with 12V DC Motor), 
  * we have to limit the duty cycle for the BTS7960 PWM Module.
  */
-#define DUTY_CYCLE_LIMIT            40
+#define DUTY_CYCLE_LIMIT            35
 #define LIMIT_ENABLE                1
 #define LIMIT_DISABLE               0
 #define LIMIT_MODE                  LIMIT_ENABLE
@@ -217,7 +217,7 @@ void receive_rf_data_task(void * parameter) {
                 motor_already_turn_off = false;
             }
 
-            // When it is a normal command.
+            // When it is a normal command. Standard format is: "/raw_data_x/raw_data_y/"
             else {
                 // Send data to Queue for motor controllers.
                 xQueueSend(tx_rx_queue, tx_buffer, 0);
@@ -239,13 +239,14 @@ void receive_rf_data_task(void * parameter) {
  * @param[in] *x pointer to address of actual input value.
  * @param[in] in_min minimum input range.
  * @param[in] in_max maximum input range.
+ * @param[in] reverse flag to reverse value conversion or not. read more in function definition.
  * @return converted value, mapped from input range -> output range (0 - 100).
  * 
  * @note The ADC raw value range: 
  * @note [0, 1800]: percentage 0 - 100% for forward direction.
  * @note [2000, 4095]: percentage 0 - 100% for backward direction.
  */
-int map_range_100_int(int *x, int in_min, int in_max, bool reverse) {
+int map_range_100_int_format(int *x, int in_min, int in_max, bool reverse) {
     // reverse for range from 0 - 1800 (backward direction, so the smaller adc value, the bigger PWM Pulse for backward).
     if (reverse) {
         // in_min -> 100, in_max -> 0
@@ -258,6 +259,16 @@ int map_range_100_int(int *x, int in_min, int in_max, bool reverse) {
         return (*x - in_min) * 100 / (in_max - in_min);
     }
 }
+
+// === HELPER FUNCTIONS ===
+static inline int clamp_percent(int val) {
+    if (val < 0) return abs(val);
+    if (val > 100) return 100;
+    return val;
+}
+
+#define ADC_BALANCE_VALUE_MIN 1920
+#define ADC_BALANCE_VALUE_MAX 2050
 
 // Read data from tx_rx_Queue Buffer, then Pass to each motor controller code. Used in RX mode.
 void get_raw_adc_from_rf(void *parameter) {
@@ -276,6 +287,103 @@ void get_raw_adc_from_rf(void *parameter) {
 }
 
 /**
+ * @brief Task to control motors speed and direction.
+ * @note This is version 2. idff
+ */
+void motor_controller_task(void *parameter) {
+    for (;;) {
+        xQueueReceive(tx_rx_queue, rx_buffer, portMAX_DELAY);
+
+        int joystick_x, joystick_y;
+        sscanf(rx_buffer, "/%d/%d/", &joystick_x, &joystick_y);
+
+        bool forward = false, backward = false;
+        bool rotate_left = false, rotate_right = false;
+
+        int y_percent = 0, x_percent = 0;
+
+        // --- Y-axis (forward / backward) ---
+        if (joystick_y > ADC_BALANCE_VALUE_MAX) {
+            y_percent = map_range_100_int_format(&joystick_y, ADC_BALANCE_VALUE_MAX, 4095, false);
+            forward = true;
+        } else if (joystick_y < ADC_BALANCE_VALUE_MIN) {
+            y_percent = map_range_100_int_format(&joystick_y, 0, ADC_BALANCE_VALUE_MIN, true);
+            backward = true;
+        } else {
+            y_percent = 0;
+        }
+
+        // --- Determine motion mode ---
+        int left_pwm = y_percent;
+        int right_pwm = y_percent;
+
+        // --- X-axis (turning) --- steering factor.
+        if (joystick_x > ADC_BALANCE_VALUE_MAX || joystick_x < ADC_BALANCE_VALUE_MIN) {
+            if(joystick_x > ADC_BALANCE_VALUE_MAX) {
+                x_percent = map_range_100_int_format(&joystick_x, ADC_BALANCE_VALUE_MAX, 4095, false); // left
+                rotate_left = true;
+                left_pwm = abs(x_percent - y_percent);
+            }
+            else if (joystick_x < ADC_BALANCE_VALUE_MIN) {
+                x_percent = map_range_100_int_format(&joystick_x, 0, ADC_BALANCE_VALUE_MIN, true); // right
+                rotate_right = true;
+                right_pwm = abs(x_percent - y_percent);
+            }
+        } 
+
+        #if LIMIT_MODE == LIMIT_ENABLE
+            if(left_pwm > DUTY_CYCLE_LIMIT) {
+                left_pwm = DUTY_CYCLE_LIMIT;
+            }
+            if(right_pwm > DUTY_CYCLE_LIMIT) {
+                right_pwm = DUTY_CYCLE_LIMIT;
+            }
+        #endif
+
+        // --- OUTPUT TO MOTORS ---
+        if (forward) {
+            // Forward motion
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, left_pwm);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, right_pwm);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, 0);
+        } 
+
+        else if (backward) {
+            // Backward motion
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, left_pwm);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, right_pwm);
+        } 
+
+        else if (rotate_left) {
+            // 2 motors must be spinning in the opposite direction.
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, 0); 
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, left_pwm);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, left_pwm);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, 0);
+        } 
+
+        else if (rotate_right) {
+            // 2 motors must be spinning in the opposite direction.
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, right_pwm);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, right_pwm);
+        } 
+
+        esp_timer_start_once(esp_timer_handle, 500000);
+
+        // printf("percent_x: %d, percent_y: %d, left_pwm: %d, right_pwm: %d | raw_X=%d raw_Y=%d | %s%s%s%s\n",
+        //        x_percent, y_percent,
+        //        left_pwm, right_pwm, joystick_x, joystick_y,
+        //        forward ? "FWD " : "", backward ? "REV " : "",
+        //        rotate_left ? "ROT_L " : "", rotate_right ? "ROT_R " : "");
+    }
+}
+
+/**
  * @brief Task to control the speed and direction of Motor A. 
  * @note This task receive raw adc value from Queue, then convert it to percentage to control the PWM Pulse.
  */
@@ -289,7 +397,7 @@ void motor_a_controller_task(void * parameter) {
 
         // Value from 0 - 1800 is backward direction.
         if(joystick_x <= 1800) {
-            int percent = map_range_100_int(&joystick_x, 0, 1800, true);
+            int percent = map_range_100_int_format(&joystick_x, 0, 1800, true);
 
             #if LIMIT_MODE == LIMIT_ENABLE
                 if(percent > DUTY_CYCLE_LIMIT) {
@@ -297,14 +405,14 @@ void motor_a_controller_task(void * parameter) {
                 }
             #endif
 
-            set_duty_cycle(MOTOR_A_FORWARD_CHANNEL, percent);
-            set_duty_cycle(MOTOR_A_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, percent);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, 0);
             esp_timer_start_once(esp_timer_handle, 500000);
         } 
 
         // Value from 2000 - 4096 is forward direction.
         else if (joystick_x >= 2000) {
-            int percent = map_range_100_int(&joystick_x, 2000, 4095, false);
+            int percent = map_range_100_int_format(&joystick_x, 2000, 4095, false);
 
             #if LIMIT_MODE == LIMIT_ENABLE
                 if(percent > DUTY_CYCLE_LIMIT) {
@@ -312,15 +420,15 @@ void motor_a_controller_task(void * parameter) {
                 }
             #endif
 
-            set_duty_cycle(MOTOR_A_FORWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_A_BACKWARD_CHANNEL, percent);
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, percent);
             esp_timer_start_once(esp_timer_handle, 500000);
         } 
 
         // Otherwise is turn off the motor driver.
         else {
-            set_duty_cycle(MOTOR_A_FORWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_A_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, 0);
         }
     }
 }
@@ -337,7 +445,7 @@ void motor_b_controller_task(void * parameter) {
         sscanf(motor_b_buffer, "%d", &joystick_y);
 
         if(joystick_y <= 1800) {
-            int percent = map_range_100_int(&joystick_y, 0, 1800, true);
+            int percent = map_range_100_int_format(&joystick_y, 0, 1800, true);
 
             #if LIMIT_MODE == LIMIT_ENABLE
                 if(percent > DUTY_CYCLE_LIMIT) {
@@ -345,13 +453,13 @@ void motor_b_controller_task(void * parameter) {
                 }
             #endif
 
-            set_duty_cycle(MOTOR_B_FORWARD_CHANNEL, percent);
-            set_duty_cycle(MOTOR_B_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, percent);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, 0);
             esp_timer_start_once(esp_timer_handle, 500000);
         } 
         
         else if (joystick_y >= 2000) {
-            int percent = map_range_100_int(&joystick_y, 2000, 4095, false);
+            int percent = map_range_100_int_format(&joystick_y, 2000, 4095, false);
 
             #if LIMIT_MODE == LIMIT_ENABLE
                 if(percent > DUTY_CYCLE_LIMIT) {
@@ -359,14 +467,14 @@ void motor_b_controller_task(void * parameter) {
                 }
             #endif
 
-            set_duty_cycle(MOTOR_B_FORWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_B_BACKWARD_CHANNEL, percent);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, percent);
             esp_timer_start_once(esp_timer_handle, 500000);
         } 
         
         else {
-            set_duty_cycle(MOTOR_B_FORWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_B_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, 0);
         }
     }
 }
@@ -381,10 +489,10 @@ void motor_b_controller_task(void * parameter) {
 void turn_off_motor_task(void * parameter) {
     for(;;) {
         if(new_command_coming_in == false && motor_already_turn_off == false) {
-            set_duty_cycle(MOTOR_A_FORWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_A_BACKWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_B_FORWARD_CHANNEL, 0);
-            set_duty_cycle(MOTOR_B_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_L_BACKWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_FORWARD_CHANNEL, 0);
+            set_duty_cycle(MOTOR_R_BACKWARD_CHANNEL, 0);
 
             // Set the flag, to skip this condition in next further loop.
             motor_already_turn_off = true;
@@ -427,15 +535,18 @@ void program_rx_mode(void) {
     NRF24_RxMode(rf_rx_addr, 10);  // same channel as TX
 
     xTaskCreate(receive_rf_data_task, "receive_rf_data_task", 2048, NULL, 4, NULL);
-    xTaskCreate(get_raw_adc_from_rf, "get_raw_adc_from_rf", 2048, NULL, 4, NULL);
+    // xTaskCreate(get_raw_adc_from_rf, "get_raw_adc_from_rf", 2048, NULL, 4, NULL);
 
-    xTaskCreate(motor_a_controller_task, "motor_a_controller", 2048, NULL, 4, NULL);
-    xTaskCreate(motor_b_controller_task, "motor_b_controller", 2048, NULL, 4, NULL);
+    // xTaskCreate(motor_a_controller_task, "motor_a_controller", 2048, NULL, 4, NULL);
+    // xTaskCreate(motor_b_controller_task, "motor_b_controller", 2048, NULL, 4, NULL);
+
+    xTaskCreate(motor_controller_task, "motor_controller_task", 2048, NULL, 4, NULL);
 
     xTaskCreate(turn_off_motor_task, 
                 "turn_off_motor_when_no_incomming_rf_data_task", 
                 2048, NULL, 4, NULL);    
 }
+
 
 void app_main(void) {
     gpio_reset_pin(LED_ON_BOARD_WEACT);
@@ -483,10 +594,10 @@ void app_main(void) {
     adc_oneshot_config_channel(adc_handle, ADC_PIN_2, &channel_cfg);
 
     // Ledc init.
-    ledc_init(MOTOR_A_FORWARD_PIN, MOTOR_A_FORWARD_CHANNEL, LEDC_FREQUENCY);
-    ledc_init(MOTOR_A_BACKWARD_PIN, MOTOR_A_BACKWARD_CHANNEL, LEDC_FREQUENCY);
-    ledc_init(MOTOR_B_FORWARD_PIN, MOTOR_B_FORWARD_CHANNEL, LEDC_FREQUENCY);
-    ledc_init(MOTOR_B_BACKWARD_PIN, MOTOR_B_BACKWARD_CHANNEL, LEDC_FREQUENCY);
+    ledc_init(MOTOR_L_FORWARD_PIN, MOTOR_L_FORWARD_CHANNEL, LEDC_FREQUENCY);
+    ledc_init(MOTOR_L_BACKWARD_PIN, MOTOR_L_BACKWARD_CHANNEL, LEDC_FREQUENCY);
+    ledc_init(MOTOR_R_FORWARD_PIN, MOTOR_R_FORWARD_CHANNEL, LEDC_FREQUENCY);
+    ledc_init(MOTOR_R_BACKWARD_PIN, MOTOR_R_BACKWARD_CHANNEL, LEDC_FREQUENCY);
 
     // nrf24l01 setup.
     setup_nrf24l01_bus();
